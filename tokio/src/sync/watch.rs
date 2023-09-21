@@ -740,7 +740,6 @@ impl<T> Receiver<T> {
     /// use tokio::sync::watch;
     ///
     /// #[tokio::main]
-    ///
     /// async fn main() {
     ///     let (tx, _rx) = watch::channel("hello");
     ///
@@ -783,6 +782,108 @@ impl<T> Receiver<T> {
 
             // Wait for the value to change.
             closed = changed_impl(&self.shared, &mut self.version).await.is_err();
+        }
+    }
+
+    /// Waits for a changed value that satisfies the provided condition.
+    ///
+    /// This method will call the `filter_changed_fn` closure whenever something
+    /// is sent on the channel, i.e. whenever the shared value has changed. Once
+    /// the closure returns `true`, this method will return a reference to the
+    /// value that was passed to the closure.
+    ///
+    /// The watch channel only keeps track of the most recent value, so if
+    /// several messages are sent faster than `wait_for_changed` is able to call the
+    /// closure, then it may skip some updates. Whenever the closure is called,
+    /// it will be called with the most recent value.
+    ///
+    /// When this function returns, the value that was passed to the closure
+    /// when it returned `true` will be considered seen. Each value is only
+    /// passed at most once to the closure.
+    ///
+    /// If the channel is closed, then `wait_for_changed` will return a `RecvError`.
+    /// But only if the last value is not considered as changed or if the closure
+    /// returned `false`.
+    ///
+    /// Like the `borrow` method, the returned borrow holds a read lock on the
+    /// inner value. This means that long-lived borrows could cause the producer
+    /// half to block. It is recommended to keep the borrow as short-lived as
+    /// possible. See the documentation of `borrow` for more information on
+    /// this.
+    ///
+    /// This method is needed to implement streams with strict _at-most-once_
+    /// semantics that yield all changed values until the channel is closed.
+    /// The initial value could be included in the stream by calling
+    /// [`mark_changed()`](Self::mark_changed) beforehand.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio::sync::watch;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let tx = watch::Sender::new("hello");
+    ///
+    ///     // Without any receivers yet we have to use `send_modify`
+    ///     // for sending a new value to circumvent an error.
+    ///     tx.send_modify(|value| *value = "hello again");
+    ///
+    ///     // Create a new receiver. It considers the current value as unchanged.
+    ///     let mut rx = tx.subscribe();
+    ///
+    ///     // Waiting for the next changed value times out before any new value is sent.
+    ///     assert!(tokio::time::timeout(
+    ///         std::time::Duration::from_millis(1),
+    ///         rx.wait_for_changed(|_| true)).await.is_err());
+    ///
+    ///     // Send a new value.
+    ///     tx.send("goodbye").unwrap();
+    ///     // Drop the sender to close the channel.
+    ///     drop(tx);
+    ///
+    ///     // The new, final value is detected and returned even though the channel
+    ///     // has already been closed by the sender.
+    ///     let last_ref = rx.wait_for_changed(|val| *val == "goodbye").await.unwrap();
+    ///     assert!(last_ref.has_changed());
+    ///     assert_eq!(*last_ref, "goodbye");
+    ///     // Drop the reference to release the read-lock. Otherwise deadlocks could occur!
+    ///     drop(last_ref);
+    ///
+    ///     // All subsequent invocations return immediately with an error,
+    ///     // because the channel is closed and the final value has already
+    ///     // been marked as seen.
+    ///     assert!(rx.wait_for_changed(|_| true).await.is_err());
+    /// }
+    /// ```
+    pub async fn wait_for_changed(
+        &mut self,
+        mut filter_changed_fn: impl FnMut(&T) -> bool,
+    ) -> Result<Ref<'_, T>, error::RecvError> {
+        loop {
+            // Wait for the value to change or the channel to be closed by the sender.
+            changed_impl(&self.shared, &mut self.version).await?;
+            let inner = self.shared.value.read().unwrap();
+            // Filter the changed value and catch a possible panic inside the closure.
+            let result = panic::catch_unwind(panic::AssertUnwindSafe(|| filter_changed_fn(&inner)));
+            match result {
+                Ok(true) => {
+                    return Ok(Ref {
+                        inner,
+                        has_changed: true,
+                    });
+                }
+                Ok(false) => {
+                    // Skip the value.
+                }
+                Err(panicked) => {
+                    // Drop the read-lock to avoid poisoning it.
+                    drop(inner);
+                    // Forward the panic to the caller.
+                    panic::resume_unwind(panicked);
+                    // Unreachable
+                }
+            };
         }
     }
 
